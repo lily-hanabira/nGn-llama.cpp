@@ -18,6 +18,32 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// PQ2_0 (PrismML) is the Q2_0 codec with one scale per 128 weights. Its weights are loaded as Q2_0:
+// each block holds a scale and the codes of weights 0-63 then 64-127, and becomes two Q2_0 blocks
+// that repeat the scale, so every dequantized weight is unchanged.
+static ggml_type llama_loaded_type(ggml_type type) {
+    return type == GGML_TYPE_PQ2_0 ? GGML_TYPE_Q2_0 : type;
+}
+
+static size_t llama_loaded_nbytes(const ggml_tensor * t) {
+    return ggml_row_size(llama_loaded_type(t->type), t->ne[0]) * (ggml_nelements(t) / t->ne[0]);
+}
+
+static void llama_expand_pq2_0(const uint8_t * src, uint8_t * dst, size_t n_blocks) {
+    const size_t scale = sizeof(ggml_fp16_t);
+    const size_t codes = ggml_type_size(GGML_TYPE_Q2_0) - scale;
+    GGML_ASSERT(ggml_type_size(GGML_TYPE_PQ2_0) == scale + 2*codes);
+    GGML_ASSERT(ggml_blck_size(GGML_TYPE_PQ2_0) == 2*ggml_blck_size(GGML_TYPE_Q2_0));
+    for (size_t i = 0; i < n_blocks; ++i) {
+        for (size_t half = 0; half < 2; ++half) {
+            memcpy(dst, src, scale);
+            memcpy(dst + scale, src + scale + half*codes, codes);
+            dst += scale + codes;
+        }
+        src += scale + 2*codes;
+    }
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -39,6 +65,8 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
+        case LLAMA_FTYPE_MOSTLY_PQ2_0:
+        case LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY: name = LLAMA_FTYPE_PREFIX "PQ2_0 (loaded as Q2_0)"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
@@ -779,6 +807,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_PQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_PQ2_0;   break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -829,6 +858,16 @@ llama_model_loader::llama_model_loader(
     if (this->use_mmap && !llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
         this->use_mmap = false;
+    }
+
+    if (this->use_mmap) {
+        for (const auto & it : weights_map) {
+            if (it.second.tensor->type == GGML_TYPE_PQ2_0) {
+                LLAMA_LOG_INFO("%s: PQ2_0 weights are expanded to Q2_0 while loading, so the model is read instead of memory-mapped\n", __func__);
+                this->use_mmap = false;
+                break;
+            }
+        }
     }
 
     this->check_tensors = check_tensors;
@@ -1339,12 +1378,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if ((flags & TENSOR_READ_LAZY) && cur->type != GGML_TYPE_PQ2_0) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
     ggml_tensor t_meta = *cur;
+    if (cur->type != llama_loaded_type(cur->type)) {
+        t_meta.type = llama_loaded_type(cur->type);
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        t_meta.nb[1] = ggml_row_size(t_meta.type, t_meta.ne[0]);
+        for (size_t dim = 2; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+        }
+    }
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
@@ -1358,7 +1405,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
-    GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+    GGML_ASSERT(ggml_nbytes(&t_meta) == llama_loaded_nbytes(cur));
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
@@ -1442,7 +1489,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        size_data += llama_loaded_nbytes(it.second.tensor);
     }
 }
 
@@ -1638,7 +1685,28 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
-        if (from_mapping) {
+        if (weight->tensor->type == GGML_TYPE_PQ2_0) {
+            GGML_ASSERT(!from_mapping && cur->buffer != nullptr);
+            const auto & file = files.at(weight->idx);
+            const size_t n_src = ggml_nbytes(weight->tensor);
+            std::vector<no_init<uint8_t>> src_buf(n_src);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(src_buf.data(), n_src);
+
+            std::vector<no_init<uint8_t>> dst_buf;
+            uint8_t * dst = (uint8_t *) cur->data;
+            if (!ggml_backend_buffer_is_host(cur->buffer)) {
+                dst_buf.resize(n_size);
+                dst = (uint8_t *) dst_buf.data();
+            }
+            llama_expand_pq2_0((const uint8_t *) src_buf.data(), dst, n_src / ggml_type_size(GGML_TYPE_PQ2_0));
+            if (check_tensors && !ggml_validate_row_data(cur->type, dst, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            if (!dst_buf.empty()) {
+                ggml_backend_tensor_set(cur, dst, 0, n_size);
+            }
+        } else if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
