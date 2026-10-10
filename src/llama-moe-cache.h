@@ -13,7 +13,7 @@ struct llama_model;
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads = 0);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -33,6 +33,19 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    // nGn: CPU execution of cache misses (LLAMA_MOE_CACHE_CPU_MISS=1 inline, =2 overlapped with the device)
+    // instead of uploading a missing expert before its matmul, the device computes the cached experts and a zero slot for
+    // the misses, while the CPU computes the missing experts from host memory; their sum replaces the expert outputs
+
+    // true if layer il computes its cache misses on the CPU
+    bool cpu_miss(int32_t il) const;
+
+    // called while building the graph of a ubatch that reads layer il from the cache: x is the FFN input [n_embd, n_tokens]
+    // and op the llm_ffn_op_type of the experts; returns the host result tensor [n_embd + 1, n_expert_used, max_batch]
+    // (per selected expert: its CPU output, then 1 if it was computed on the device or 0 if on the CPU),
+    // or nullptr if the layer cannot compute its misses on the CPU in this graph
+    ggml_tensor * cpu_miss_prepare(int32_t il, ggml_tensor * x, int op, float alpha, float limit) const;
 
 private:
     struct impl;

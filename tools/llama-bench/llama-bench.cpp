@@ -1316,6 +1316,11 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // nGn: the MoE expert cache has no sweep parameter here; LLAMA_ARG_MOE_CACHE_MIB applies it to every test
+        if (const char * mib = std::getenv("LLAMA_ARG_MOE_CACHE_MIB")) {
+            cparams.moe_cache_size = (size_t) std::max(0L, std::strtol(mib, nullptr, 10))*1024*1024;
+        }
+
         return cparams;
     }
 };

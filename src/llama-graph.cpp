@@ -2256,6 +2256,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    // nGn: the cache misses of this layer may run on the CPU, then cpu_res holds their outputs (see llama_moe_cache::cpu_miss)
+    ggml_tensor * cpu_res = nullptr;
+    if (slots != nullptr && moe_cache->cpu_miss(il)) {
+        bool eligible = !weight_before_ffn && loras->empty() && up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr;
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            if (w != nullptr && hadamard_rotations && hadamard_rotations->find(w) != hadamard_rotations->end()) {
+                eligible = false;
+            }
+        }
+        if (type_op == LLM_FFN_SILU && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+            eligible = false;
+        }
+        const float alpha = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 1.702f : 0.0f;
+        const float limit = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 7.0f   : 0.0f;
+        cpu_res = moe_cache->cpu_miss_prepare(il, eligible ? cur : nullptr, type_op, alpha, limit);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2417,6 +2434,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    if (cpu_res != nullptr) {
+        // the device computed the cached experts and a zero slot for the misses, the CPU computed the misses:
+        // experts*mask + cpu, with per selected expert mask = 1 if it was cached and cpu = 0 then
+        ggml_build_forward_expand(gf, experts); // the device experts come first, the result copy then starts a new split
+
+        ggml_backend_t dev = moe_cache->backend(il);
+        ggml_tensor * res = ggml_cont(ctx0, cpu_res); // read from host memory, copied by the copy callback
+        ggml_backend_sched_set_tensor_backend(sched, res, dev);
+        cb(res, "ffn_moe_cpu_res", il);
+
+        const size_t row = res->nb[1];
+        ggml_tensor * mask = ggml_cont(ctx0, ggml_view_3d(ctx0, res, 1,      n_expert_used, n_tokens, row, row*n_expert_used, n_embd*ggml_element_size(res)));
+        ggml_tensor * vals = ggml_cont(ctx0, ggml_view_3d(ctx0, res, n_embd, n_expert_used, n_tokens, row, row*n_expert_used, 0));
+        experts = ggml_add(ctx0, ggml_mul(ctx0, experts, mask), vals);
+        for (ggml_tensor * t : { mask, vals, experts->src[0], experts }) {
+            ggml_backend_sched_set_tensor_backend(sched, t, dev);
+        }
+        cb(experts, "ffn_moe_down_cpu_merged", il);
     }
 
     if (!weight_before_ffn) {
