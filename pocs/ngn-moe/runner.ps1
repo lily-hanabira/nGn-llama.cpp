@@ -16,7 +16,8 @@ while ($true) {
   $log = Join-Path $logs "$name.log"
   Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $name) -ForegroundColor Yellow
   "start $(Get-Date -Format o)" | Set-Content $log -Encoding utf8
-  & powershell -NoProfile -ExecutionPolicy Bypass -File $running *>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log -Append | Out-Host
+  # Jobs get empty input: a tool that stops to ask a question fails at once instead of holding the queue.
+  $null | & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $running *>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log -Append | Out-Host
   $ok = $LASTEXITCODE -eq 0
   "end $(Get-Date -Format o) exit $LASTEXITCODE" | Add-Content $log -Encoding utf8
   Move-Item -Force $running (Join-Path $queue ("$name." + $(if ($ok) { "done" } else { "failed" })))
