@@ -1272,6 +1272,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    if (params.moe_cache_auto && !model_only) {
+        params.moe_cache_size = common_fit_moe_cache(params.model.path.c_str(), &mparams, &cparams,
+            params.tensor_split, params.moe_cache_margin,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;

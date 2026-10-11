@@ -5,7 +5,9 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
@@ -1110,4 +1112,60 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.context/1024/1024);
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
+}
+
+size_t common_fit_moe_cache(
+        const char * path_model,
+        const llama_model_params * mparams,
+        llama_context_params * cparams,
+        const float * tensor_split,
+        size_t margin,
+        ggml_log_level log_level) {
+    constexpr double MiB = 1024.0*1024.0;
+    llama_context_params cp = *cparams;
+    cp.moe_cache_size = 0;
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+    std::vector<llama_device_memory_data> dmds;
+    try {
+        dmds = common_get_device_memory_data_impl(path_model, mparams, &cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    } catch (const std::runtime_error & e) {
+        LOG_WRN("%s: could not measure device memory, MoE cache disabled: %s\n", __func__, e.what());
+        cparams->moe_cache_size = 0;
+        return 0;
+    }
+    const bool by_split = tensor_split != nullptr &&
+        std::any_of(tensor_split, tensor_split + devs.size(), [](float x) { return x != 0.0f; });
+
+    // the share of each device in the cache's split, and its room
+    std::vector<double> share(devs.size(), 0.0), room(devs.size(), 0.0);
+    double share_sum = 0.0;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(devs[i]);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const llama_device_memory_data & d = dmds[i];
+        const double used = (double) (d.mb.model + d.mb.context + d.mb.compute);
+        room[i]  = (double) d.free - used - (double) margin;
+        // the cache splits by the tensor split, or by the free memory left after the model and context
+        share[i] = by_split ? (double) tensor_split[i] : std::max(0.0, (double) d.free - (double) (d.mb.model + d.mb.context));
+        share_sum += share[i];
+        LOG_INF("%s: %s: free %.0f MiB, model %.0f + context %.0f + compute %.0f MiB, margin %.0f MiB -> room %.0f MiB\n",
+            __func__, ggml_backend_dev_name(devs[i]), d.free/MiB, d.mb.model/MiB, d.mb.context/MiB, d.mb.compute/MiB,
+            margin/MiB, room[i]/MiB);
+    }
+    double total = share_sum > 0.0 ? INFINITY : 0.0;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (share[i] <= 0.0) {
+            continue;
+        }
+        total = std::min(total, std::max(0.0, room[i])*share_sum/share[i]);
+    }
+    if (!std::isfinite(total)) {
+        total = 0.0;
+    }
+    cparams->moe_cache_size = (size_t) total;
+    LOG_INF("%s: MoE cache size set to %.0f MiB%s\n", __func__, total/MiB, devs.size() > 1 ? " across the devices" : "");
+    return cparams->moe_cache_size;
 }

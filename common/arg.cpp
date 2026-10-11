@@ -2777,15 +2777,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        {"--moe-cache-mib"}, "N|auto",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split); "
+        "'auto' measures the model and context first and gives the cache what is left of each device's free memory (see --moe-cache-margin) (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_auto = true;
+                params.moe_cache_size = 0;
+                return;
+            }
+            const int v = std::stoi(value);
+            if (v < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_auto = false;
+            params.moe_cache_size = (size_t) v*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-margin"}, "MiB",
+        string_format("device memory in MiB to leave free on each device when --moe-cache-mib is auto (default: %zu)", params.moe_cache_margin/(1024*1024)),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_margin = (size_t) value*1024*1024;
         }
-    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    ).set_env("LLAMA_ARG_MOE_CACHE_MARGIN"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

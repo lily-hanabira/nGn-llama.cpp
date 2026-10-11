@@ -37,6 +37,18 @@ common_params_fit_status common_fit_params(
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// nGn: sizes the MoE expert cache (cparams->moe_cache_size) from free device memory: a dry run with the cache off
+// measures the model, context and compute memory of each device, and the cache gets what remains after margin bytes
+// per device. With several devices the cache is split like the layers (by the tensor split, else by free memory), so
+// the total is limited by the device with the least room for its share. Returns the size set, 0 if nothing fits.
+size_t common_fit_moe_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+                        const float * tensor_split,
+                              size_t   margin,
+                     ggml_log_level   log_level);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,
