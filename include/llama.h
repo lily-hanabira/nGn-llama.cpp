@@ -399,6 +399,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        int32_t moe_cpu_misses; // nGn: experts the cache misses run on the CPU: 0 = no (uploaded), 1 = inline, 2 = overlapped with the decode doorbell, -1 = LLAMA_MOE_CACHE_CPU_MISS or 0
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

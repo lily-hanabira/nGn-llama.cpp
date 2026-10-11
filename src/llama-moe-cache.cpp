@@ -418,9 +418,11 @@ struct llama_moe_cache::impl {
         double promote_ms = 0.0; // doorbell: time spent uploading promotions between ubatches
     } cstats;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads) :
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads, int cpu_misses) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
-        if (const char * v = std::getenv("LLAMA_MOE_CACHE_CPU_MISS")) {
+        if (cpu_misses >= 0) {
+            cpu_mode = std::clamp(cpu_misses, 0, 2);
+        } else if (const char * v = std::getenv("LLAMA_MOE_CACHE_CPU_MISS")) {
             cpu_mode = std::clamp(std::atoi(v), 0, 2);
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE")) {
@@ -1685,8 +1687,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads) :
-    pimpl(new impl(model, backends, bufts, size, n_threads)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads, int cpu_misses) :
+    pimpl(new impl(model, backends, bufts, size, n_threads, cpu_misses)) {
 }
 
 bool llama_moe_cache::cpu_miss(int32_t il) const {

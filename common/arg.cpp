@@ -2795,6 +2795,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cpu-misses"}, "off|inline|on",
+        "where the experts the MoE cache misses run: 'off' uploads them to the GPU, 'inline' computes them on the CPU, "
+        "'on' computes them on the CPU overlapped with the GPU (the decode doorbell) (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") { params.moe_cpu_misses = 0; }
+            else if (value == "inline") { params.moe_cpu_misses = 1; }
+            else if (value == "on") { params.moe_cpu_misses = 2; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MOE_CPU_MISSES"));
+    add_opt(common_arg(
         {"--moe-cache-margin"}, "MiB",
         string_format("device memory in MiB to leave free on each device when --moe-cache-mib is auto (default: %zu)", params.moe_cache_margin/(1024*1024)),
         [](common_params & params, int value) {
