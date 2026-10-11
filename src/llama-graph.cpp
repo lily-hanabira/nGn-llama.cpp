@@ -2253,24 +2253,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
-
-    // nGn: the cache misses of this layer may run on the CPU, then cpu_res holds their outputs (see llama_moe_cache::cpu_miss)
-    ggml_tensor * cpu_res = nullptr;
-    if (slots != nullptr && moe_cache->cpu_miss(il)) {
-        bool eligible = !weight_before_ffn && loras->empty() && up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr;
+    // nGn: the cache misses of this layer may run on the CPU (see llama_moe_cache::cpu_miss)
+    bool cpu_eligible = false;
+    const float cpu_alpha = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 1.702f : 0.0f;
+    const float cpu_limit = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 7.0f   : 0.0f;
+    if (moe_cache != nullptr && moe_cache->cpu_miss(il)) {
+        cpu_eligible = !weight_before_ffn && loras->empty() && up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr;
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
-            if (w != nullptr && hadamard_rotations && hadamard_rotations->find(w) != hadamard_rotations->end()) {
-                eligible = false;
+            if (w != nullptr && (moe_cache->get_experts(w) == nullptr ||
+                    (hadamard_rotations && hadamard_rotations->find(w) != hadamard_rotations->end()))) {
+                cpu_eligible = false;
             }
         }
         if (type_op == LLM_FFN_SILU && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
-            eligible = false;
+            cpu_eligible = false;
         }
-        const float alpha = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 1.702f : 0.0f;
-        const float limit = type_op == LLM_FFN_SWIGLU_OAI_MOE ? 7.0f   : 0.0f;
-        cpu_res = moe_cache->cpu_miss_prepare(il, eligible ? cur : nullptr, type_op, alpha, limit);
+    }
+
+    ggml_tensor * slots   = nullptr;
+    ggml_tensor * cpu_res = nullptr; // multi-token: the CPU's outputs, copied by the copy callback
+    ggml_tensor * ticket  = nullptr; // one token: the doorbell
+    ggml_moe_mailbox * mailbox = nullptr;
+    if (cpu_eligible && n_tokens == 1 && moe_cache->doorbell(il) && ggml_is_contiguous(cur)) {
+        // decode: the cached experts are read through the device slot table, the CPU is rung before the device experts
+        ggml_tensor * ids = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used);
+        slots   = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->doorbell_table(il), ids), n_expert_used, 1);
+        mailbox = moe_cache->doorbell_mailbox(il);
+        moe_cache->doorbell_prepare(il, type_op, cpu_alpha, cpu_limit, n_expert_used);
+        ticket  = ggml_moe_publish(ctx0, cur, ids, mailbox);
+        cb(ticket, "ffn_moe_doorbell", il);
+        ggml_build_forward_expand(gf, ticket);
+    } else {
+        // the experts of host-resident layers may be read from the MoE cache
+        slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+        if (slots != nullptr && moe_cache->cpu_miss(il)) {
+            cpu_res = moe_cache->cpu_miss_prepare(il, cpu_eligible ? cur : nullptr, type_op, cpu_alpha, cpu_limit);
+        }
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -2436,7 +2454,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (cpu_res != nullptr) {
+    if (ticket != nullptr) {
+        // the device computed the cached experts (a miss read the zero slot), the host pool the misses: experts*mask + cpu
+        ggml_build_forward_expand(gf, experts);
+        ggml_tensor * res = ggml_moe_wait(ctx0, ticket, experts, n_embd + 1, n_expert_used, 1, mailbox);
+        cb(res, "ffn_moe_cpu_res", il);
+        ggml_tensor * mask = ggml_cont(ctx0, ggml_view_3d(ctx0, res, 1,      n_expert_used, 1, res->nb[1], res->nb[2], n_embd*ggml_element_size(res)));
+        ggml_tensor * vals = ggml_cont(ctx0, ggml_view_3d(ctx0, res, n_embd, n_expert_used, 1, res->nb[1], res->nb[2], 0));
+        experts = ggml_add(ctx0, ggml_mul(ctx0, experts, mask), vals);
+        cb(experts, "ffn_moe_down_cpu_merged", il);
+    } else if (cpu_res != nullptr) {
         // the device computed the cached experts and a zero slot for the misses, the CPU computed the misses:
         // experts*mask + cpu, with per selected expert mask = 1 if it was cached and cpu = 0 then
         ggml_build_forward_expand(gf, experts); // the device experts come first, the result copy then starts a new split

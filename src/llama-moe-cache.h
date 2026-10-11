@@ -47,6 +47,17 @@ public:
     // or nullptr if the layer cannot compute its misses on the CPU in this graph
     ggml_tensor * cpu_miss_prepare(int32_t il, ggml_tensor * x, int op, float alpha, float limit) const;
 
+    // nGn: the decode doorbell (LLAMA_MOE_CACHE_CPU_MISS=2, one-token ubatches): the graph reads the cached experts
+    // through a device slot table (a miss reads a zero slot and is masked) and hands the FFN input and the routed ids to
+    // the host's expert pool with ggml_moe_publish / ggml_moe_wait, so no host stall happens inside the ubatch
+    bool doorbell(int32_t il) const;
+    ggml_tensor * doorbell_table(int32_t il) const;          // I32 [1, n_expert] on the device
+    struct ggml_moe_mailbox * doorbell_mailbox(int32_t il) const;
+    void doorbell_prepare(int32_t il, int op, float alpha, float limit, int64_t n_expert_used) const;
+
+    // called before each ubatch's graph is computed: applies promotions and refreshes the device tables
+    void begin_ubatch();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

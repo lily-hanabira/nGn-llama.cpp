@@ -602,6 +602,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_HANDOFF, // nGn: CPU/GPU expert handoff through a host-mapped mailbox
+
         GGML_OP_COUNT,
     };
 
@@ -1294,6 +1296,39 @@ extern "C" {
     // A: n columns, r rows,
     // result is n / 2 columns, r rows,
     // expects gate in second half of row, unless swapped is true
+    // nGn: hand the routed experts of one token to the host and take the host's result back, without synchronizing the
+    // stream (a "doorbell", after Strata). The mailbox lives in page-locked host memory that the device can address.
+    //   seq:  incremented by publish after x and ids are written, the host waits for it to change
+    //   flag: set to seq by the host after res is written, wait spins on it on the device
+    // timeout_ms bounds the device-side wait; on timeout wait writes zeros and sets error.
+    struct ggml_moe_mailbox {
+        volatile uint32_t seq;
+        volatile uint32_t flag;
+        uint32_t timeout_ms;
+        volatile uint32_t error;
+        float   * x;   // [n_embd]
+        int32_t * ids; // [n_ids]
+        float   * res; // [n_res]
+    };
+
+    // publish: copy x (F32) and ids (I32), both contiguous, into the mailbox and ring it; returns a 1-element I32 ticket
+    GGML_API struct ggml_tensor * ggml_moe_publish(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * x,
+            struct ggml_tensor      * ids,
+            struct ggml_moe_mailbox * mailbox);
+
+    // wait: after ticket, wait for the host's answer and copy ne0*ne1*ne2 floats of the mailbox result into a new tensor;
+    // after (optional, not read) orders the wait behind the device work that overlaps the host's
+    GGML_API struct ggml_tensor * ggml_moe_wait(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * ticket,
+            struct ggml_tensor      * after,
+            int64_t                   ne0,
+            int64_t                   ne1,
+            int64_t                   ne2,
+            struct ggml_moe_mailbox * mailbox);
+
     GGML_API struct ggml_tensor * ggml_glu(
             struct ggml_context * ctx,
              struct ggml_tensor * a,

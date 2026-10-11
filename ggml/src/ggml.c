@@ -1106,9 +1106,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_HANDOFF",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,9 +1223,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_handoff(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2916,6 +2920,50 @@ struct ggml_tensor * ggml_exp_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_EXP);
+}
+
+// ggml_moe_publish / ggml_moe_wait (nGn)
+
+static void ggml_moe_set_mailbox(struct ggml_tensor * t, int32_t mode, struct ggml_moe_mailbox * mailbox) {
+    const uint64_t p = (uint64_t) (uintptr_t) mailbox;
+    const int32_t params[3] = { mode, (int32_t) (p & 0xffffffffu), (int32_t) (p >> 32) };
+    ggml_set_op_params(t, params, sizeof(params));
+}
+
+struct ggml_tensor * ggml_moe_publish(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * x,
+        struct ggml_tensor      * ids,
+        struct ggml_moe_mailbox * mailbox) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(mailbox != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_moe_set_mailbox(result, 0, mailbox);
+    result->op     = GGML_OP_MOE_HANDOFF;
+    result->src[0] = x;
+    result->src[1] = ids;
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_wait(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * ticket,
+        struct ggml_tensor      * after,
+        int64_t                   ne0,
+        int64_t                   ne1,
+        int64_t                   ne2,
+        struct ggml_moe_mailbox * mailbox) {
+    GGML_ASSERT(ticket->op == GGML_OP_MOE_HANDOFF);
+    GGML_ASSERT(mailbox != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+    ggml_moe_set_mailbox(result, 1, mailbox);
+    result->op     = GGML_OP_MOE_HANDOFF;
+    result->src[0] = ticket;
+    result->src[1] = after;
+    return result;
 }
 
 // ggml_glu

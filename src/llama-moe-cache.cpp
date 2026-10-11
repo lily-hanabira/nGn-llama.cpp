@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-cpu.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +19,30 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+// nGn: Windows may treat a process it thinks is background work as EcoQoS and hold its threads on efficiency cores;
+// the CPU computes the expert misses on those threads (PolyStrata measured 39 -> 57-62 tok/s on a laptop from this)
+static void llama_moe_cache_no_power_throttling() {
+#if defined(_WIN32) && defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION)
+    PROCESS_POWER_THROTTLING_STATE state = {};
+    state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask   = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state))) {
+        LLAMA_LOG_WARN("%s: could not opt out of power throttling (%lu)\n", __func__, (unsigned long) GetLastError());
+    }
+#endif
+}
 
 namespace {
 
@@ -293,7 +319,21 @@ struct llama_moe_cache::impl {
         int64_t n_tokens = 0;
         ggml_tensor * w_gate_up = nullptr, * w_gate = nullptr, * w_up = nullptr, * w_down = nullptr; // host weights
         ggml_tensor * b_gate_up = nullptr, * b_gate = nullptr, * b_up = nullptr, * b_down = nullptr; // host biases
+        bool fast = false; // computed by the CPU pool rather than a ggml graph
+        llama_moe_cpu_pool::layer_weights lw;
     };
+
+    std::unique_ptr<llama_moe_cpu_pool> fast_pool;
+    std::vector<int32_t> fast_tok, fast_ids;
+    std::vector<float>   fast_out;
+
+    void set_op(cpu_layer & c, int op, float alpha, float limit) {
+        c.op    = op;
+        c.alpha = alpha;
+        c.limit = limit;
+        c.fast  = fast_pool && llama_moe_cpu_pool::supports(c.w_gate_up, c.w_gate, c.w_up, c.w_down, c.b_gate_up, c.b_gate, c.b_up, c.b_down, op);
+        c.lw = { c.w_gate_up, c.w_gate, c.w_up, c.w_down, c.b_gate_up, c.b_gate, c.b_up, c.b_down, op, alpha, limit };
+    }
     std::vector<cpu_layer> cpu_layers;
     std::unordered_map<const ggml_tensor *, int32_t> res_of; // result tensor -> layer
     std::vector<int32_t> misses;
@@ -317,13 +357,53 @@ struct llama_moe_cache::impl {
     bool job_done    = true;
     bool stop        = false;
 
+    // nGn: the decode doorbell (one token per ubatch, cpu_mode 2): the device publishes the FFN input and the routed ids
+    // into a page-locked mailbox per layer and reads its cached experts through a device-resident slot table, where a
+    // miss reads the zero slot (n_slots) and is masked; the pool thread answers each mailbox with the CPU's experts.
+    // Nothing on the host waits for the device inside a ubatch; promotions are applied between ubatches.
+    bool     doorbell_on         = false;
+    uint32_t doorbell_timeout_ms = 10000;
+    int      promote_budget      = 2;     // promotions per ubatch, most-missed experts first
+    ggml_backend_buffer_ptr          buf_mail;
+    std::vector<ggml_moe_mailbox *>  mail;           // [n_layer]
+    std::vector<uint32_t>            mail_seen;      // [n_layer] last seq answered by the pool
+    std::vector<ggml_tensor *>       dev_table;      // [n_layer] I32 [1, n_expert] on the device
+    std::vector<std::vector<int32_t>> dev_table_host;
+    std::atomic<bool>                tables_dirty{true};
+    std::mutex                       cand_mtx;
+    std::unordered_map<int64_t, uint32_t> cand;      // (il << 32) | e -> misses since its last promotion pass
+    uint32_t                         cand_passes = 0;
+    std::thread                      pool;
+    std::atomic<bool>                pool_stop{false};
+    std::vector<int32_t>             pool_misses, pool_pt, pool_pj, pool_pe;
+    // promotions: after a token's last layer the pool copies the most-missed experts into page-locked staging slots,
+    // the next ubatch's start uploads them asynchronously (a pageable 13 MB copy blocked the host for ~4 ms)
+    struct stage_slot {
+        std::atomic<int> state{0}; // 0 free, 1 staged, 2 uploading
+        int32_t   il   = -1;
+        int32_t   e    = -1;
+        uint8_t * data = nullptr;
+    };
+    std::unique_ptr<stage_slot[]> stage;
+    int                     n_stage     = 0;
+    size_t                  stage_bytes = 0;
+    ggml_backend_buffer_ptr buf_stage;
+    int32_t                 last_mail   = -1;
+    std::thread                      prefault;      // touches every page of the host experts once after load
+    std::atomic<bool>                prefault_stop{false};
+
     struct cpu_stats {
         size_t calls      = 0; // layer evaluations with at least one miss on the CPU
         size_t experts    = 0; // experts computed on the CPU
         size_t hits       = 0;
         size_t promotions = 0;
         double cpu_ms     = 0.0; // time spent computing on the CPU
+        double setup_ms   = 0.0; //   of which building and allocating the CPU graph
+        double math_ms    = 0.0; //   of which the expert matmuls
         double wait_ms    = 0.0; // time the graph waited for the CPU result
+        size_t rings      = 0;   // doorbell: layer evaluations answered by the pool
+        size_t promote_bytes = 0;
+        double promote_ms = 0.0; // doorbell: time spent uploading promotions between ubatches
     } cstats;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads) :
@@ -336,6 +416,31 @@ struct llama_moe_cache::impl {
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE_EVERY")) {
             promote_every = std::max(1, std::atoi(v));
+        }
+        if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE_BUDGET")) {
+            promote_budget = std::max(0, std::atoi(v));
+        }
+        if (const char * v = std::getenv("LLAMA_MOE_CACHE_DOORBELL_TIMEOUT_MS")) {
+            doorbell_timeout_ms = (uint32_t) std::max(0, std::atoi(v));
+        }
+        {
+            const char * v = std::getenv("LLAMA_MOE_CACHE_DOORBELL");
+            doorbell_on = cpu_mode == 2 && (v == nullptr || std::atoi(v) != 0);
+            if (doorbell_on) {
+                for (ggml_backend_t b : backends) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(b);
+                    const auto type = ggml_backend_dev_type(dev);
+                    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        continue;
+                    }
+                    // the device must run the handoff op and expose page-locked host memory it can address
+                    ggml_tensor probe = {};
+                    probe.op = GGML_OP_MOE_HANDOFF;
+                    if (!ggml_backend_dev_supports_op(dev, &probe) || ggml_backend_dev_host_buffer_type(dev) == nullptr) {
+                        doorbell_on = false;
+                    }
+                }
+            }
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_THREADS")) {
             n_threads = std::max(1, std::atoi(v));
@@ -389,12 +494,13 @@ struct llama_moe_cache::impl {
             return;
         }
 
-        // one extra slot at the end, CUDA MMQ can read past the last expert
+        // one extra slot at the end, CUDA MMQ can read past the last expert; the doorbell adds the zero slot before it
+        const int32_t zero_slots = doorbell_on ? 1 : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
+                res += GGML_PAD(t->nb[2]*(n_slots + 1 + zero_slots), alignment);
             }
             return res;
         };
@@ -446,7 +552,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (doorbell_on ? g.layers.size() : 0);
             n_tensors_host  += g.layers.size()*(cpu_mode > 0 ? 2 : 1);
         }
         if (n_tensors_host == 0) {
@@ -483,7 +589,7 @@ struct llama_moe_cache::impl {
             }
             ggml_context * ctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1 + zero_slots);
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -494,9 +600,16 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + zero_slots, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                }
+                if (doorbell_on) {
+                    if (dev_table.empty()) {
+                        dev_table.assign(layers.size(), nullptr);
+                    }
+                    dev_table[il] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(dev_table[il], "moe_cache.table-%d", il);
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
@@ -569,6 +682,11 @@ struct llama_moe_cache::impl {
 
         if (cpu_mode > 0 && !cpu_layers.empty() && !model.hparams.no_alloc) {
             init_cpu(model, n_threads);
+            if (doorbell_on) {
+                init_doorbell();
+            }
+        } else {
+            doorbell_on = false;
         }
 
         for (size_t id = 0; id < devices.size(); ++id) {
@@ -589,6 +707,324 @@ struct llama_moe_cache::impl {
 
     ggml_backend_t backend(int32_t il) const {
         return devices[groups[layers[il].ig].id].backend;
+    }
+
+
+    //
+    // nGn: the decode doorbell
+    //
+
+    void init_doorbell() {
+        ggml_backend_dev_t dev = ggml_backend_get_device(devices[0].backend);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+        const size_t align = 64;
+        const size_t head  = GGML_PAD(sizeof(ggml_moe_mailbox), align);
+        const size_t x_sz  = GGML_PAD((size_t) n_embd*sizeof(float), align);
+        const size_t id_sz = GGML_PAD((size_t) n_expert_used*sizeof(int32_t), align);
+        const size_t r_sz  = GGML_PAD((size_t) (n_embd + 1)*n_expert_used*sizeof(float), align);
+        const size_t per   = head + x_sz + id_sz + r_sz;
+
+        size_t n_mail = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            n_mail += (layers[il].ig >= 0 && cpu_layers[il].supported && dev_table[il] != nullptr) ? 1 : 0;
+        }
+        if (n_mail == 0 || buft == nullptr) {
+            doorbell_on = false;
+            return;
+        }
+        buf_mail.reset(ggml_backend_buft_alloc_buffer(buft, n_mail*per + align));
+        if (!buf_mail || !ggml_backend_buffer_is_host(buf_mail.get())) {
+            LLAMA_LOG_WARN("%s: no page-locked host memory for the MoE doorbell, it is disabled\n", __func__);
+            buf_mail.reset();
+            doorbell_on = false;
+            return;
+        }
+        uint8_t * base = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(buf_mail.get()), align);
+        std::memset(base, 0, n_mail*per);
+
+        mail.assign(layers.size(), nullptr);
+        mail_seen.assign(layers.size(), 0);
+        dev_table_host.assign(layers.size(), {});
+        size_t k = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (!(layers[il].ig >= 0 && cpu_layers[il].supported && dev_table[il] != nullptr)) {
+                continue;
+            }
+            uint8_t * p = base + (k++)*per;
+            ggml_moe_mailbox * mb = (ggml_moe_mailbox *) p;
+            mb->timeout_ms = doorbell_timeout_ms;
+            mb->x   = (float   *) (p + head);
+            mb->ids = (int32_t *) (p + head + x_sz);
+            mb->res = (float   *) (p + head + x_sz + id_sz);
+            mail[il] = mb;
+        }
+        for (size_t il = 0; il < mail.size(); ++il) {
+            if (mail[il] != nullptr) {
+                last_mail = (int32_t) il;
+                size_t bytes = 0;
+                for (const ggml_tensor * w : layers[il].experts) {
+                    bytes += w->nb[2];
+                }
+                stage_bytes = std::max(stage_bytes, bytes);
+            }
+        }
+        if (promote_budget > 0 && stage_bytes > 0) {
+            buf_stage.reset(ggml_backend_buft_alloc_buffer(buft, (size_t) promote_budget*stage_bytes + align));
+            if (buf_stage && ggml_backend_buffer_is_host(buf_stage.get())) {
+                n_stage = promote_budget;
+                stage.reset(new stage_slot[n_stage]);
+                uint8_t * sb = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(buf_stage.get()), align);
+                for (int i = 0; i < n_stage; ++i) {
+                    stage[i].data = sb + (size_t) i*stage_bytes;
+                }
+            } else {
+                buf_stage.reset();
+                LLAMA_LOG_WARN("%s: no page-locked staging for promotions, the cache will not adapt during decode\n", __func__);
+            }
+        }
+        upload_tables();
+        for (device & d : devices) {
+            ggml_backend_synchronize(d.backend);
+        }
+        pool = std::thread([this] { pool_loop(); });
+        LLAMA_LOG_INFO("%s: MoE decode doorbell on for %zu layers (%.2f MiB page-locked), promote at most %d experts per ubatch, timeout %u ms\n",
+            __func__, n_mail, n_mail*per/1024.0/1024.0, promote_budget, doorbell_timeout_ms);
+    }
+
+    bool doorbell(int32_t il) const {
+        return doorbell_on && il >= 0 && il < (int32_t) mail.size() && mail[il] != nullptr;
+    }
+
+    // the slots of the device table: the cached slot, or the zero slot (n_slots) for a miss
+    void upload_tables() {
+        for (size_t il = 0; il < mail.size(); ++il) {
+            if (mail[il] == nullptr) {
+                continue;
+            }
+            const group & g = groups[layers[il].ig];
+            const int32_t * slots = g.lru.slot_map[il];
+            auto & h = dev_table_host[il];
+            h.resize(g.lru.n_expert);
+            for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                h[e] = slots[e] >= 0 ? slots[e] : g.n_slots;
+            }
+            ggml_backend_tensor_set_async(devices[g.id].backend, dev_table[il], h.data(), 0, h.size()*sizeof(int32_t));
+        }
+        tables_dirty = false;
+    }
+
+    void pool_loop() {
+#if defined(_WIN32)
+        // the GPU waits on this thread at every MoE layer: do not let it queue behind spinning compute threads
+        if (std::getenv("LLAMA_MOE_CACHE_POOL_NORMAL_PRIORITY") == nullptr) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        }
+#endif
+        // spin (no yield) for this many idle scans before backing off: a decode token's layers are well inside it
+        static const uint32_t spin_scans = [] {
+            const char * v = std::getenv("LLAMA_MOE_CACHE_POOL_SPIN");
+            return v ? (uint32_t) std::max(0, std::atoi(v)) : 2000000u;
+        }();
+        uint32_t idle = 0;
+        while (!pool_stop.load(std::memory_order_relaxed)) {
+            bool did = false;
+            for (size_t il = 0; il < mail.size(); ++il) {
+                ggml_moe_mailbox * mb = mail[il];
+                if (mb == nullptr) {
+                    continue;
+                }
+                const uint32_t seq = mb->seq;
+                if (seq == mail_seen[il]) {
+                    continue;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                answer((int32_t) il, mb, seq);
+                mail_seen[il] = seq;
+                did = true;
+                if ((int32_t) il == last_mail) {
+                    stage_promotions();
+                }
+            }
+            if (did) {
+                idle = 0;
+            } else if (++idle > spin_scans + 200000) {
+                // idle for a while (no decode): stop burning a core
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            } else if (idle > spin_scans) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    void answer(int32_t il, ggml_moe_mailbox * mb, uint32_t seq) {
+        cpu_layer & c = cpu_layers[il];
+        group & g = groups[layers[il].ig];
+        const int64_t n_used = c.n_used > 0 ? c.n_used : n_expert_used;
+        const int32_t * ids = mb->ids;
+        const int64_t row = n_embd + 1;
+
+        size_t n_hit = 0;
+        g.lru.classify(il, ids, (size_t) n_used, pool_misses, n_hit);
+        const int32_t * slots = g.lru.slot_map[il];
+
+        float * res = mb->res;
+        std::fill(res, res + row*n_used, 0.0f);
+        pool_pt.clear();
+        pool_pj.clear();
+        pool_pe.clear();
+        for (int64_t j = 0; j < n_used; ++j) {
+            const int32_t e = ids[j];
+            if (slots[e] >= 0) {
+                res[j*row + n_embd] = 1.0f;
+            } else {
+                pool_pt.push_back(0);
+                pool_pj.push_back((int32_t) j);
+                pool_pe.push_back(e);
+            }
+        }
+        if (!pool_pe.empty()) {
+            // diagnostics only (wrong outputs): LLAMA_MOE_CACHE_DEBUG_NO_CPU=1 answers without computing the misses
+            static const bool no_cpu = std::getenv("LLAMA_MOE_CACHE_DEBUG_NO_CPU") != nullptr;
+            if (!no_cpu) {
+                compute_misses(c, mb->x, pool_pt, pool_pj, pool_pe, n_used, res);
+            }
+            cstats.calls++;
+            cstats.experts += pool_misses.size();
+            std::lock_guard<std::mutex> lk(cand_mtx);
+            for (int32_t e : pool_misses) {
+                cand[((int64_t) il << 32) | (uint32_t) e]++;
+            }
+        }
+        cstats.hits += n_hit;
+        cstats.rings++;
+
+        std::atomic_thread_fence(std::memory_order_release);
+        mb->flag = seq;
+    }
+
+
+    // on the pool thread, after a token's last layer: copy the most-missed experts into free staging slots
+    void stage_promotions() {
+        if (n_stage == 0) {
+            return;
+        }
+        int n_free = 0;
+        for (int i = 0; i < n_stage; ++i) {
+            n_free += stage[i].state.load(std::memory_order_acquire) == 0 ? 1 : 0;
+        }
+        if (n_free == 0) {
+            return;
+        }
+        std::vector<std::pair<uint32_t, int64_t>> top;
+        {
+            std::lock_guard<std::mutex> lk(cand_mtx);
+            for (const auto & [key, n] : cand) {
+                if (n >= 2) {
+                    top.emplace_back(n, key);
+                }
+            }
+            if (++cand_passes % 256 == 0) {
+                cand.clear(); // forget old topics
+            }
+        }
+        std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        size_t t = 0;
+        for (int i = 0; i < n_stage && t < top.size(); ++i) {
+            stage_slot & sl = stage[i];
+            if (sl.state.load(std::memory_order_acquire) != 0) {
+                continue;
+            }
+            for (; t < top.size(); ++t) {
+                const int32_t il = (int32_t) (top[t].second >> 32);
+                const int32_t e  = (int32_t) (top[t].second & 0xffffffff);
+                if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || groups[layers[il].ig].lru.slot_map[il][e] >= 0) {
+                    continue;
+                }
+                bool staged = false;
+                for (int k = 0; k < n_stage; ++k) {
+                    staged |= stage[k].state.load(std::memory_order_acquire) != 0 && stage[k].il == il && stage[k].e == e;
+                }
+                if (staged) {
+                    continue;
+                }
+                size_t off = 0;
+                for (const ggml_tensor * w : layers[il].experts) {
+                    const size_t sz = w->nb[2];
+                    const uint8_t * src = (const uint8_t *) w->data + (size_t) e*sz;
+                    if (fast_pool) {
+                        fast_pool->copy(sl.data + off, src, sz);
+                    } else {
+                        std::memcpy(sl.data + off, src, sz);
+                    }
+                    off += sz;
+                }
+                sl.il = il;
+                sl.e  = e;
+                sl.state.store(1, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lk(cand_mtx);
+                    cand.erase(top[t].second);
+                }
+                ++t;
+                break;
+            }
+        }
+    }
+
+    // between ubatches: report a stuck pool, promote the most-missed experts, refresh the device tables
+    void begin_ubatch() {
+        if (!doorbell_on) {
+            return;
+        }
+        for (size_t il = 0; il < mail.size(); ++il) {
+            if (mail[il] != nullptr && mail[il]->error != 0) {
+                GGML_ABORT("MoE doorbell: the CPU expert pool did not answer layer %zu within %u ms", il, doorbell_timeout_ms);
+            }
+        }
+        if (n_stage > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            // uploads queued before the previous ubatch are done once the device finished it (normally already)
+            bool uploading = false;
+            for (int i = 0; i < n_stage; ++i) {
+                uploading |= stage[i].state.load(std::memory_order_acquire) == 2;
+            }
+            if (uploading) {
+                for (device & d : devices) {
+                    ggml_backend_synchronize(d.backend);
+                }
+                for (int i = 0; i < n_stage; ++i) {
+                    int expected = 2;
+                    stage[i].state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+                }
+            }
+            for (int i = 0; i < n_stage; ++i) {
+                stage_slot & sl = stage[i];
+                if (sl.state.load(std::memory_order_acquire) != 1) {
+                    continue;
+                }
+                group & g = groups[layers[sl.il].ig];
+                const int32_t slot = g.lru.slot_map[sl.il][sl.e] >= 0 ? -1 : g.lru.promote(sl.il, sl.e);
+                if (slot < 0) {
+                    sl.state.store(0, std::memory_order_release);
+                    continue;
+                }
+                size_t off = 0;
+                const layer & l = layers[sl.il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t sz = l.experts[ip]->nb[2];
+                    ggml_backend_tensor_set_async(devices[g.id].backend, g.banks[ip], sl.data + off, (size_t) slot*sz, sz);
+                    off += sz;
+                    cstats.promote_bytes += sz;
+                }
+                cstats.promotions++;
+                tables_dirty = true;
+                sl.state.store(2, std::memory_order_release);
+            }
+            cstats.promote_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        if (tables_dirty) {
+            upload_tables();
+        }
     }
 
     //
@@ -666,6 +1102,43 @@ struct llama_moe_cache::impl {
             }
         }
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend.get()));
+
+        // opt-in: MXFP4 experts (gpt-oss) on a pool of pinned workers instead of a ggml graph per layer; on the Blade
+        // (i9-13950HX) the ggml graph was faster once the doorbell removed the host stalls (0.57 vs 0.74 ms an expert)
+        if (const char * v = std::getenv("LLAMA_MOE_CACHE_FAST"); v != nullptr && std::atoi(v) != 0) {
+            int n_fast = 0; // the performance cores
+            if (const char * t = std::getenv("LLAMA_MOE_CACHE_THREADS")) {
+                n_fast = std::max(1, std::atoi(t));
+            }
+            fast_pool = std::make_unique<llama_moe_cpu_pool>(n_fast);
+        }
+
+        llama_moe_cache_no_power_throttling();
+
+        // a mapped page's first read is a page fault: take them now, in the background, rather than in the first
+        // tokens' expert misses (PolyStrata measured the first use at twice the time of a mapped page)
+        if (std::getenv("LLAMA_MOE_CACHE_NO_PREFAULT") == nullptr) {
+            std::vector<std::pair<const uint8_t *, size_t>> ranges;
+            for (const layer & l : layers) {
+                for (const ggml_tensor * w : l.experts) {
+                    ranges.emplace_back((const uint8_t *) w->data, ggml_nbytes(w));
+                }
+            }
+            prefault = std::thread([this, ranges] {
+                const auto t0 = std::chrono::steady_clock::now();
+                volatile uint8_t sink = 0;
+                size_t bytes = 0;
+                for (const auto & [p, n] : ranges) {
+                    for (size_t off = 0; off < n && !prefault_stop.load(std::memory_order_relaxed); off += 4096) {
+                        sink = sink + p[off];
+                    }
+                    bytes += n;
+                }
+                (void) sink;
+                LLAMA_LOG_INFO("llama_moe_cache: touched %.2f GiB of host experts in %.1f s\n", bytes/1024.0/1024.0/1024.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            });
+        }
         if (cpu_mode == 2) {
             worker = std::thread([this] { worker_loop(); });
         }
@@ -690,9 +1163,7 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         c.x      = x;
-        c.op     = op;
-        c.alpha  = alpha;
-        c.limit  = limit;
+        set_op(c, op, alpha, limit);
         c.active = true;
         return c.res;
     }
@@ -838,12 +1309,31 @@ struct llama_moe_cache::impl {
 
     // the selected experts that missed the cache, one per row: [n_embd, 1, n_miss] through the layer's expert FFN
     void run_job() {
-        const int64_t n_miss = (int64_t) job.pair_e.size();
+        cpu_layer & c = cpu_layers[job.il];
+        compute_misses(c, job.x.data(), job.pair_t, job.pair_j, job.pair_e, c.n_used, (float *) c.res->data);
+    }
+
+    // the selected experts that missed the cache, one per row: [n_embd, 1, n_miss] through the layer's expert FFN;
+    // xs holds the FFN input of each token, res gets row (t*n_used + j)*(n_embd + 1) of each miss
+    void compute_misses(cpu_layer & c, const float * xs, const std::vector<int32_t> & pair_t, const std::vector<int32_t> & pair_j,
+            const std::vector<int32_t> & pair_e, int64_t n_used, float * res) {
+        const int64_t n_miss = (int64_t) pair_e.size();
         if (n_miss == 0) {
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        cpu_layer & c = cpu_layers[job.il];
+        if (c.fast) {
+            fast_out.resize((size_t) n_miss*n_embd);
+            fast_pool->compute(c.lw, xs, pair_t.data(), pair_e.data(), (int) n_miss, fast_out.data(), n_embd);
+            const int64_t row = n_embd + 1;
+            for (int64_t k = 0; k < n_miss; ++k) {
+                std::memcpy(res + ((int64_t) pair_t[k]*n_used + pair_j[k])*row, fast_out.data() + k*n_embd, n_embd*sizeof(float));
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            cstats.cpu_ms  += ms;
+            cstats.math_ms += ms;
+            return;
+        }
 
         ggml_init_params params = { 32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true };
         ggml_context_ptr ctx_ptr(ggml_init(params));
@@ -888,24 +1378,35 @@ struct llama_moe_cache::impl {
 
         float * xd = (float *) x->data;
         for (int64_t k = 0; k < n_miss; ++k) {
-            std::memcpy(xd + k*n_embd, job.x.data() + (int64_t) job.pair_t[k]*n_embd, n_embd*sizeof(float));
+            std::memcpy(xd + k*n_embd, xs + (int64_t) pair_t[k]*n_embd, n_embd*sizeof(float));
         }
-        std::memcpy(id->data, job.pair_e.data(), n_miss*sizeof(int32_t));
+        std::memcpy(id->data, pair_e.data(), n_miss*sizeof(int32_t));
 
+        const auto t1 = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(cpu_backend.get(), gf) != GGML_STATUS_SUCCESS) {
             GGML_ABORT("failed to compute the MoE cache misses on the CPU");
         }
+        const auto t2 = std::chrono::steady_clock::now();
 
         const int64_t row = n_embd + 1;
-        float * res = (float *) c.res->data;
         for (int64_t k = 0; k < n_miss; ++k) {
             const float * src = (const float *) ((const char *) out->data + k*out->nb[2]);
-            std::memcpy(res + ((int64_t) job.pair_t[k]*c.n_used + job.pair_j[k])*row, src, n_embd*sizeof(float));
+            std::memcpy(res + ((int64_t) pair_t[k]*n_used + pair_j[k])*row, src, n_embd*sizeof(float));
         }
-        cstats.cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        cstats.cpu_ms   += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        cstats.setup_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        cstats.math_ms  += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
 
     ~impl() {
+        if (prefault.joinable()) {
+            prefault_stop = true;
+            prefault.join();
+        }
+        if (pool.joinable()) {
+            pool_stop = true;
+            pool.join();
+        }
         if (worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(mtx);
@@ -1016,6 +1517,7 @@ struct llama_moe_cache::impl {
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
 
+        tables_dirty = true;
         if (!cpu_layers.empty() && cpu_layers[il].active) {
             copy_cpu_miss(backend, il, g, sel, dst);
             return true;
@@ -1067,8 +1569,9 @@ struct llama_moe_cache::impl {
         log("ubatch  > 8", stats_large);
         if (cstats.calls > 0 || cstats.hits > 0) {
             const size_t n = cstats.hits + cstats.experts;
-            LLAMA_LOG_INFO("llama_moe_cache: cpu misses: hits = %zu, cpu experts = %zu, hit rate = %.2f%%, promotions = %zu, cpu = %.1f ms, waited = %.1f ms over %zu layer calls\n",
-                cstats.hits, cstats.experts, n ? 100.0*cstats.hits/n : 0.0, cstats.promotions, cstats.cpu_ms, cstats.wait_ms, cstats.calls);
+            LLAMA_LOG_INFO("llama_moe_cache: cpu misses: hits = %zu, cpu experts = %zu, hit rate = %.2f%%, promotions = %zu, cpu = %.1f ms (setup %.1f, math %.1f), waited = %.1f ms over %zu layer calls, %zu doorbell rings, promote %.1f ms / %.1f MiB\n",
+                cstats.hits, cstats.experts, n ? 100.0*cstats.hits/n : 0.0, cstats.promotions, cstats.cpu_ms, cstats.setup_ms, cstats.math_ms,
+                cstats.wait_ms, cstats.calls, cstats.rings, cstats.promote_ms, cstats.promote_bytes/1024.0/1024.0);
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -1086,6 +1589,28 @@ bool llama_moe_cache::cpu_miss(int32_t il) const {
 
 ggml_tensor * llama_moe_cache::cpu_miss_prepare(int32_t il, ggml_tensor * x, int op, float alpha, float limit) const {
     return pimpl->cpu_miss_prepare(il, x, op, alpha, limit);
+}
+
+bool llama_moe_cache::doorbell(int32_t il) const {
+    return pimpl->doorbell(il);
+}
+
+ggml_tensor * llama_moe_cache::doorbell_table(int32_t il) const {
+    return pimpl->doorbell(il) ? pimpl->dev_table[il] : nullptr;
+}
+
+ggml_moe_mailbox * llama_moe_cache::doorbell_mailbox(int32_t il) const {
+    return pimpl->doorbell(il) ? pimpl->mail[il] : nullptr;
+}
+
+void llama_moe_cache::doorbell_prepare(int32_t il, int op, float alpha, float limit, int64_t n_expert_used) const {
+    auto & c = pimpl->cpu_layers[il];
+    pimpl->set_op(c, op, alpha, limit);
+    c.n_used = n_expert_used;
+}
+
+void llama_moe_cache::begin_ubatch() {
+    pimpl->begin_ubatch();
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

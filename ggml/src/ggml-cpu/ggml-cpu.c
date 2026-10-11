@@ -1737,6 +1737,39 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// nGn: see ggml_moe_publish / ggml_moe_wait
+static struct ggml_moe_mailbox * ggml_moe_mailbox_of(const struct ggml_tensor * t) {
+    const uint64_t lo = (uint32_t) ggml_get_op_params_i32(t, 1);
+    const uint64_t hi = (uint32_t) ggml_get_op_params_i32(t, 2);
+    return (struct ggml_moe_mailbox *) (uintptr_t) (lo | (hi << 32));
+}
+
+static void ggml_compute_forward_moe_handoff(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    struct ggml_moe_mailbox * mb = ggml_moe_mailbox_of(dst);
+    if (ggml_get_op_params_i32(dst, 0) == 0) {
+        memcpy(mb->x,   dst->src[0]->data, ggml_nbytes(dst->src[0]));
+        memcpy(mb->ids, dst->src[1]->data, ggml_nbytes(dst->src[1]));
+        atomic_thread_fence(memory_order_seq_cst);
+        mb->seq = mb->seq + 1;
+        ((int32_t *) dst->data)[0] = (int32_t) mb->seq;
+    } else {
+        const uint32_t want  = mb->seq;
+        const int64_t  start = ggml_time_ms();
+        while (mb->flag != want) {
+            if (mb->timeout_ms > 0 && ggml_time_ms() - start > (int64_t) mb->timeout_ms) {
+                mb->error = 1;
+                memset(dst->data, 0, ggml_nbytes(dst));
+                return;
+            }
+        }
+        atomic_thread_fence(memory_order_seq_cst);
+        memcpy(dst->data, mb->res, ggml_nbytes(dst));
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2060,6 +2093,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
+            } break;
+        case GGML_OP_MOE_HANDOFF:
+            {
+                ggml_compute_forward_moe_handoff(params, tensor);
             } break;
         case GGML_OP_GET_REL_POS:
             {
@@ -2494,6 +2531,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_MOE_HANDOFF:
             {
                 n_tasks = 1;
             } break;
