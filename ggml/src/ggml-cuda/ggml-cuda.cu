@@ -403,8 +403,38 @@ static ggml_cuda_device_info ggml_cuda_init() {
     return info;
 }
 
+// nGn: GGML_CUDA_BALLAST_MIB=n holds n MiB of device 0 for the life of the process, to emulate a smaller GPU. It has
+// to live in the process: on Windows (WDDM) the driver evicts an idle allocation of another process to make room, so
+// a separate "hog" process does not shrink what this one can use.
+static void ggml_cuda_ballast(const ggml_cuda_device_info & info) {
+    const char * v = getenv("GGML_CUDA_BALLAST_MIB");
+    if (v == nullptr || info.device_count == 0) {
+        return;
+    }
+    const size_t mib = (size_t) atoll(v);
+    int prev = 0;
+    CUDA_CHECK(cudaGetDevice(&prev));
+    CUDA_CHECK(cudaSetDevice(0));
+    size_t held = 0;
+    for (; held + 64 <= mib; held += 64) {
+        void * p = nullptr;
+        if (cudaMalloc(&p, 64ull << 20) != cudaSuccess) {
+            (void) cudaGetLastError();
+            break;
+        }
+        CUDA_CHECK(cudaMemset(p, 0, 64ull << 20));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t free_b = 0, total_b = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+    GGML_LOG_INFO("%s: holding %zu MiB of device 0 to emulate a smaller GPU, %zu of %zu MiB free\n", __func__, held, free_b >> 20, total_b >> 20);
+    CUDA_CHECK(cudaSetDevice(prev));
+}
+
 const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info = ggml_cuda_init();
+    static const bool ballast = (ggml_cuda_ballast(info), true);
+    GGML_UNUSED(ballast);
     return info;
 }
 

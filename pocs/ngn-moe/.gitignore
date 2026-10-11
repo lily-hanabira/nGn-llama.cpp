@@ -1,3 +1,7 @@
 logs/
 queue/
 bastion-sync/
+tools/*.exe
+tools/*.obj
+tools/*.lib
+tools/*.exp
