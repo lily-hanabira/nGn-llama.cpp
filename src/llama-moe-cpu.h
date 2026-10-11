@@ -14,6 +14,9 @@
 
 struct ggml_tensor;
 
+// one logical CPU per physical core of the most performant class (Windows hybrid CPUs); empty if unknown
+std::vector<int> llama_moe_performance_cpus();
+
 class llama_moe_cpu_pool {
 public:
     // n_threads includes the calling thread; 0 picks the physical performance cores (Windows) or half the logical CPUs

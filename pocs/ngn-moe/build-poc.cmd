@@ -35,7 +35,7 @@ git -C "%SRC%" status --short >> "%LOG%"
 
 cmake -S "%SRC%" -B "%NGN_POC_BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=ON ^
   -DCMAKE_CUDA_ARCHITECTURES=%ARCH% -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" -DLLAMA_CURL=OFF ^
-  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON >> "%LOG%" 2>&1 || ( echo configure failed, see %LOG% & exit /b 2 )
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON %NGN_POC_CMAKE_EXTRA% >> "%LOG%" 2>&1 || ( echo configure failed, see %LOG% & exit /b 2 )
 cmake --build "%NGN_POC_BUILD%" --config Release --target llama-bench llama-server llama-perplexity -j %NUMBER_OF_PROCESSORS% >> "%LOG%" 2>&1 || ( echo build failed, see %LOG% & exit /b 3 )
 >> "%LOG%" echo BUILD OK %DATE% %TIME%
 echo BUILD OK: %NGN_POC_BUILD%\bin

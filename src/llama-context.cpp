@@ -1296,6 +1296,10 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
 
     cparams.n_threads       = n_threads;
     cparams.n_threads_batch = n_threads_batch;
+
+    if (moe_cache) {
+        moe_cache->set_n_threads(n_threads);
+    }
 }
 
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {

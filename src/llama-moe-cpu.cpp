@@ -98,8 +98,10 @@ float dot_mxfp4_scalar(const block_mxfp4_t * x, const int8_t * q, const float * 
 #if defined(LLAMA_MOE_X86)
 #if defined(__GNUC__) || defined(__clang__)
 #define LLAMA_MOE_AVX2 __attribute__((target("avx2,fma")))
+#define LLAMA_MOE_AVX2_VNNI __attribute__((target("avx2,fma,avxvnni")))
 #else
 #define LLAMA_MOE_AVX2
+#define LLAMA_MOE_AVX2_VNNI
 #endif
 
 LLAMA_MOE_AVX2 inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
@@ -143,6 +145,56 @@ LLAMA_MOE_AVX2 float dot_mxfp4_avx2(const block_mxfp4_t * x, const int8_t * q, c
     return sum;
 }
 
+// four consecutive rows against one activation: the activation block is loaded once, each row has its own
+// accumulator. The nibbles of a block go to both 128-bit lanes and are shifted per lane (low nibbles: elements 0-15,
+// high nibbles: 16-31), so one 256-bit table lookup decodes the block.
+template <bool VNNI>
+LLAMA_MOE_AVX2_VNNI void dot4_mxfp4_avx2(const block_mxfp4_t * x0, size_t stride, const int8_t * q, const float * d, int nb, float * out) {
+    const __m256i lut  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) kvalues_fp4_local));
+    const __m256i m4   = _mm256_set1_epi8(0x0f);
+    const __m256i sh   = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
+    const __m256i mone = _mm256_set1_epi16(1);
+    const block_mxfp4_t * x1 = (const block_mxfp4_t *) ((const char *) x0 + stride);
+    const block_mxfp4_t * x2 = (const block_mxfp4_t *) ((const char *) x0 + 2*stride);
+    const block_mxfp4_t * x3 = (const block_mxfp4_t *) ((const char *) x0 + 3*stride);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps(), acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i xq = _mm256_loadu_si256((const __m256i *) (q + ib*QK));
+        const float dx = d[ib];
+#define LLAMA_MOE_ROW(xr, acc) { \
+            const block_mxfp4_t & b = (xr)[ib]; \
+            const __m256i v = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) b.qs)); \
+            const __m256i w = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srlv_epi32(v, sh), m4)); \
+            __m256i p; \
+            if constexpr (VNNI) { \
+                p = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(w, w), _mm256_sign_epi8(xq, w)); \
+            } else { \
+                p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(xq, w)), mone); \
+            } \
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(dx*e8m0_half[b.e]), _mm256_cvtepi32_ps(p), acc); }
+        LLAMA_MOE_ROW(x0, acc0)
+        LLAMA_MOE_ROW(x1, acc1)
+        LLAMA_MOE_ROW(x2, acc2)
+        LLAMA_MOE_ROW(x3, acc3)
+#undef LLAMA_MOE_ROW
+    }
+    out[0] = hsum8(acc0); out[1] = hsum8(acc1); out[2] = hsum8(acc2); out[3] = hsum8(acc3);
+}
+
+bool cpu_has_avx_vnni() {
+#if defined(_MSC_VER)
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7) {
+        return false;
+    }
+    __cpuidex(r, 7, 1);
+    return (r[0] & (1 << 4)) != 0;
+#else
+    return __builtin_cpu_supports("avxvnni");
+#endif
+}
+
 bool cpu_has_avx2_fma() {
 #if defined(_MSC_VER)
     int r[4];
@@ -164,7 +216,30 @@ bool cpu_has_avx2_fma() {
 }
 #endif // LLAMA_MOE_X86
 
-using dot_fn_t = float (*)(const block_mxfp4_t *, const int8_t *, const float *, int);
+using dot_fn_t  = float (*)(const block_mxfp4_t *, const int8_t *, const float *, int);
+using dot4_fn_t = void  (*)(const block_mxfp4_t *, size_t, const int8_t *, const float *, int, float *);
+
+void dot4_scalar(const block_mxfp4_t * x0, size_t stride, const int8_t * q, const float * d, int nb, float * out) {
+    for (int r = 0; r < 4; ++r) {
+        out[r] = dot_mxfp4_scalar((const block_mxfp4_t *) ((const char *) x0 + r*stride), q, d, nb);
+    }
+}
+
+const char * g_dot4_name = "scalar";
+
+dot4_fn_t pick_dot4() {
+#if defined(LLAMA_MOE_X86)
+    if (cpu_has_avx2_fma()) {
+        if (cpu_has_avx_vnni() && std::getenv("LLAMA_MOE_CPU_NO_VNNI") == nullptr) {
+            g_dot4_name = "AVX2 + AVX-VNNI, 4 rows";
+            return dot4_mxfp4_avx2<true>;
+        }
+        g_dot4_name = "AVX2, 4 rows";
+        return dot4_mxfp4_avx2<false>;
+    }
+#endif
+    return dot4_scalar;
+}
 
 dot_fn_t pick_dot() {
 #if defined(LLAMA_MOE_X86)
@@ -175,8 +250,9 @@ dot_fn_t pick_dot() {
     return dot_mxfp4_scalar;
 }
 
-// one logical CPU per physical core of the most performant class (Windows); empty if unknown
-std::vector<int> performance_cpus() {
+// one logical CPU per physical core of the most performant class (perf) or of the other classes (!perf), Windows;
+// empty if unknown
+std::vector<int> cpus_of_class(bool perf) {
     std::vector<int> res;
 #if defined(_WIN32)
     DWORD len = 0;
@@ -206,7 +282,7 @@ std::vector<int> performance_cpus() {
         off += info->Size;
     }
     for (const core & c : cores) {
-        if (c.cls == best) {
+        if ((c.cls == best) == perf) {
             res.push_back(c.cpu);
         }
     }
@@ -228,8 +304,10 @@ void pin_current_thread(int cpu) {
 #endif
 }
 
-dot_fn_t g_dot = nullptr;
+dot_fn_t  g_dot  = nullptr;
+dot4_fn_t g_dot4 = nullptr;
 int      g_rows     = 16;  // rows per work item (LLAMA_MOE_CPU_ROWS)
+uint32_t g_spin     = 8192; // pauses before a worker starts yielding (LLAMA_MOE_CPU_SPIN)
 int      g_prefetch = 0;   // rows to prefetch ahead of the row being computed, 0 = none (LLAMA_MOE_CPU_PREFETCH)
 
 // the hardware prefetcher stops at 4 KiB page boundaries, an expert's rows are one long stream across them
@@ -248,27 +326,44 @@ inline void prefetch_bytes(const void * p, size_t n) {
 
 llama_moe_cpu_pool::llama_moe_cpu_pool(int n_threads) {
     init_tables();
-    g_dot = pick_dot();
+    g_dot  = pick_dot();
+    g_dot4 = pick_dot4();
     if (const char * v = std::getenv("LLAMA_MOE_CPU_ROWS")) {
         g_rows = std::max(1, std::atoi(v));
+    }
+    if (const char * v = std::getenv("LLAMA_MOE_CPU_SPIN")) {
+        g_spin = (uint32_t) std::max(1, std::atoi(v));
     }
     if (const char * v = std::getenv("LLAMA_MOE_CPU_PREFETCH")) {
         g_prefetch = std::max(0, std::atoi(v));
     }
-    std::vector<int> pcores = performance_cpus();
+    std::vector<int> pcores = cpus_of_class(true);
     if (n_threads <= 0) {
         n_threads = pcores.empty() ? (int) std::max(1u, std::thread::hardware_concurrency()/2) : (int) pcores.size();
     }
-    n_threads_ = std::max(1, n_threads);
+    // efficiency cores join after the performance cores (LLAMA_MOE_CPU_ECORES, default all of them): their row
+    // products are ~2.5x slower but the work items are claimed dynamically, and on the Blade (i9-13950HX) 16 E-cores
+    // alone read an expert faster than the 8 P-cores
+    std::vector<int> ecores = pcores.empty() ? std::vector<int>() : cpus_of_class(false);
+    int n_e = (int) ecores.size();
+    if (const char * v = std::getenv("LLAMA_MOE_CPU_ECORES")) {
+        n_e = std::clamp(std::atoi(v), 0, (int) ecores.size());
+    }
+    n_threads = std::max(1, n_threads);
+    n_threads_ = n_threads + n_e;
     cpus_.assign(n_threads_, -1);
-    for (int i = 0; i < n_threads_ && i < (int) pcores.size(); ++i) {
+    for (int i = 0; i < n_threads && i < (int) pcores.size(); ++i) {
         cpus_[i] = pcores[i];
+    }
+    for (int i = 0; i < n_e; ++i) {
+        cpus_[n_threads + i] = ecores[i];
     }
     for (int i = 1; i < n_threads_; ++i) {
         workers_.emplace_back([this, i] { worker_main(i); });
     }
-    LLAMA_LOG_INFO("%s: %d threads for CPU experts (%s), %zu performance cores found, row product %s, %d rows a task, prefetch %d rows\n", __func__, n_threads_,
-        pcores.empty() ? "not pinned" : "pinned to performance cores", pcores.size(), g_dot != dot_mxfp4_scalar ? "AVX2" : "scalar", g_rows, g_prefetch);
+    LLAMA_LOG_INFO("%s: %d threads for CPU experts (%d performance + %d efficiency cores, %s), row product %s, %d rows a task, prefetch %d rows\n", __func__, n_threads_,
+        n_threads, n_e, pcores.empty() ? "not pinned" : "pinned", g_dot4_name,
+        g_rows, g_prefetch);
 }
 
 llama_moe_cpu_pool::~llama_moe_cpu_pool() {
@@ -307,9 +402,9 @@ void llama_moe_cpu_pool::worker_main(int index) {
         uint32_t g;
         uint32_t spins = 0;
         while ((g = gen_.load(std::memory_order_acquire)) == seen) {
-            if (++spins < 8192) {
+            if (++spins < g_spin) {
                 cpu_relax();
-            } else if (spins < 8192 + 50000) {
+            } else if (spins < g_spin + 50000) {
                 std::this_thread::yield();
             } else {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -387,11 +482,20 @@ void phase_up(void * vctx, int item) {
     const float  * d = j.d8x + (int64_t) i*nb;
     float * h = j.hidden + (int64_t) i*2*j.n_ff;
     const auto & w = *j.w;
-    for (int64_t r = r0; r < r1; ++r) {
-        if (g_prefetch > 0 && r + g_prefetch < r1) {
-            const int64_t rp = r + g_prefetch;
-            const ggml_tensor * t = w.gate_up ? w.gate_up : (rp < j.n_ff ? w.gate : w.up);
-            prefetch_bytes(row_of(t, e, w.gate_up ? rp : (rp < j.n_ff ? rp : rp - j.n_ff)), t->nb[1]);
+    for (int64_t r = r0; r < r1; ) {
+        // four rows of one tensor at a time
+        const bool same = w.gate_up || (r < j.n_ff) == (r + 3 < j.n_ff);
+        if (r + 4 <= r1 && same) {
+            const ggml_tensor * t  = w.gate_up ? w.gate_up : (r < j.n_ff ? w.gate : w.up);
+            const ggml_tensor * bt = w.gate_up ? w.b_gate_up : (r < j.n_ff ? w.b_gate : w.b_up);
+            const int64_t rr = (w.gate_up || r < j.n_ff) ? r : r - j.n_ff;
+            float o4[4];
+            g_dot4(row_of(t, e, rr), t->nb[1], q, d, nb, o4);
+            for (int k = 0; k < 4; ++k) {
+                h[r + k] = o4[k] + bias_of(bt, e, rr + k);
+            }
+            r += 4;
+            continue;
         }
         if (w.gate_up) {
             h[r] = g_dot(row_of(w.gate_up, e, r), q, d, nb) + bias_of(w.b_gate_up, e, r);
@@ -400,6 +504,7 @@ void phase_up(void * vctx, int item) {
         } else {
             h[r] = g_dot(row_of(w.up, e, r - j.n_ff), q, d, nb) + bias_of(w.b_up, e, r - j.n_ff);
         }
+        ++r;
     }
 }
 
@@ -413,10 +518,15 @@ void phase_down(void * vctx, int item) {
     const int8_t * q = j.q8a + (int64_t) i*j.n_ff;
     const float  * d = j.d8a + (int64_t) i*nb;
     float * o = j.out + (int64_t) i*j.out_stride;
-    for (int64_t r = r0; r < r1; ++r) {
-        if (g_prefetch > 0 && r + g_prefetch < r1) {
-            prefetch_bytes(row_of(j.w->down, e, r + g_prefetch), j.w->down->nb[1]);
+    int64_t r = r0;
+    for (; r + 4 <= r1; r += 4) {
+        float o4[4];
+        g_dot4(row_of(j.w->down, e, r), j.w->down->nb[1], q, d, nb, o4);
+        for (int k = 0; k < 4; ++k) {
+            o[r + k] = o4[k] + bias_of(j.w->b_down, e, r + k);
         }
+    }
+    for (; r < r1; ++r) {
         o[r] = g_dot(row_of(j.w->down, e, r), q, d, nb) + bias_of(j.w->b_down, e, r);
     }
 }
@@ -498,4 +608,8 @@ void phase_copy(void * vctx, int item) {
 void llama_moe_cpu_pool::copy(void * dst, const void * src, size_t n) {
     copy_job j = { (uint8_t *) dst, (const uint8_t *) src, n, (size_t) 1 << 20 };
     run_phase((int) ((n + j.chunk - 1)/j.chunk), phase_copy, &j);
+}
+
+std::vector<int> llama_moe_performance_cpus() {
+    return cpus_of_class(true);
 }

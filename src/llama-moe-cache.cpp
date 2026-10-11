@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -349,6 +350,10 @@ struct llama_moe_cache::impl {
     cpu_job job;
     ggml_backend_ptr cpu_backend;
     ggml_gallocr_t   galloc = nullptr;
+    ggml_threadpool_t cpu_tp = nullptr;
+    int  cur_threads      = 0;
+    bool threads_from_env = false;
+    void (*cpu_tp_free)(ggml_threadpool_t) = nullptr;
 
     std::thread             worker;
     std::mutex              mtx;
@@ -375,6 +380,13 @@ struct llama_moe_cache::impl {
     uint32_t                         cand_passes = 0;
     std::thread                      pool;
     std::atomic<bool>                pool_stop{false};
+    // promotions are copied into the staging buffers by their own thread: on the pool thread the ~13 MB copy per
+    // promoted expert delayed the next token's first doorbell by ~2.8 ms on average
+    std::thread                      stager;
+    std::mutex                       stager_mtx;
+    std::condition_variable          stager_cv;
+    bool                             stager_req  = false;
+    bool                             stager_stop = false;
     std::vector<int32_t>             pool_misses, pool_pt, pool_pj, pool_pe;
     // promotions: after a token's last layer the pool copies the most-missed experts into page-locked staging slots,
     // the next ubatch's start uploads them asynchronously (a pageable 13 MB copy blocked the host for ~4 ms)
@@ -444,6 +456,7 @@ struct llama_moe_cache::impl {
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_THREADS")) {
             n_threads = std::max(1, std::atoi(v));
+            threads_from_env = true;
         }
         promote_tick.assign(model.layers.size(), 0);
         n_embd = model.hparams.n_embd;
@@ -787,6 +800,7 @@ struct llama_moe_cache::impl {
             ggml_backend_synchronize(d.backend);
         }
         pool = std::thread([this] { pool_loop(); });
+        stager = std::thread([this] { stager_loop(); });
         LLAMA_LOG_INFO("%s: MoE decode doorbell on for %zu layers (%.2f MiB page-locked), promote at most %d experts per ubatch, timeout %u ms\n",
             __func__, n_mail, n_mail*per/1024.0/1024.0, promote_budget, doorbell_timeout_ms);
     }
@@ -811,6 +825,23 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_set_async(devices[g.id].backend, dev_table[il], h.data(), 0, h.size()*sizeof(int32_t));
         }
         tables_dirty = false;
+    }
+
+    void stager_loop() {
+#if defined(_WIN32)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(stager_mtx);
+                stager_cv.wait(lk, [this] { return stager_req || stager_stop; });
+                if (stager_stop) {
+                    return;
+                }
+                stager_req = false;
+            }
+            stage_promotions();
+        }
     }
 
     void pool_loop() {
@@ -841,8 +872,12 @@ struct llama_moe_cache::impl {
                 answer((int32_t) il, mb, seq);
                 mail_seen[il] = seq;
                 did = true;
-                if ((int32_t) il == last_mail) {
-                    stage_promotions();
+                if ((int32_t) il == last_mail && n_stage > 0) {
+                    {
+                        std::lock_guard<std::mutex> lk(stager_mtx);
+                        stager_req = true;
+                    }
+                    stager_cv.notify_one();
                 }
             }
             if (did) {
@@ -951,11 +986,7 @@ struct llama_moe_cache::impl {
                 for (const ggml_tensor * w : layers[il].experts) {
                     const size_t sz = w->nb[2];
                     const uint8_t * src = (const uint8_t *) w->data + (size_t) e*sz;
-                    if (fast_pool) {
-                        fast_pool->copy(sl.data + off, src, sz);
-                    } else {
-                        std::memcpy(sl.data + off, src, sz);
-                    }
+                    std::memcpy(sl.data + off, src, sz); // stager thread: the CPU pool belongs to the doorbell thread
                     off += sz;
                 }
                 sl.il = il;
@@ -1031,6 +1062,74 @@ struct llama_moe_cache::impl {
     // nGn: CPU execution of cache misses
     //
 
+    // (re)configures the CPU backend of the misses for nt threads; llama_set_n_threads can change it between decodes
+    void setup_threads(int nt_req) {
+        if (!cpu_backend) {
+            return;
+        }
+        const int n_threads = nt_req > 0 ? nt_req : GGML_DEFAULT_N_THREADS;
+        if (n_threads == cur_threads) {
+            return;
+        }
+        cur_threads = n_threads;
+        {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_backend.get()));
+            auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (set_n_threads) {
+                set_n_threads(cpu_backend.get(), n_threads);
+            }
+            auto set_tp = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (cpu_tp && cpu_tp_free && set_tp) {
+                set_tp(cpu_backend.get(), nullptr);
+                cpu_tp_free(cpu_tp);
+                cpu_tp = nullptr;
+            }
+        }
+        // opt-in (LLAMA_MOE_CACHE_TP=1): a persistent threadpool for the miss graphs instead of ggml's per-graph one.
+        // Workers go on the physical performance cores, at high priority, and poll between layers
+        // (LLAMA_MOE_CACHE_POLL, 0-100, default 100); LLAMA_MOE_CACHE_NO_PIN=1 keeps OS placement. On the Blade it was
+        // not faster (25.1 vs 27.8 tok/s at 8 threads): spinning workers take power from the cores doing the work.
+        if (const char * v = std::getenv("LLAMA_MOE_CACHE_TP"); v != nullptr && std::atoi(v) != 0) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_backend.get()));
+            auto tp_new  = (decltype(ggml_threadpool_new) *)  ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+            auto tp_free = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+            auto set_tp  = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (tp_new && tp_free && set_tp) {
+                const int nt = n_threads > 0 ? n_threads : GGML_DEFAULT_N_THREADS;
+                ggml_threadpool_params tpp = ggml_threadpool_params_default(nt);
+                tpp.prio = GGML_SCHED_PRIO_HIGH;
+                tpp.poll = 100;
+                if (const char * v = std::getenv("LLAMA_MOE_CACHE_POLL")) {
+                    tpp.poll = (uint32_t) std::clamp(std::atoi(v), 0, 100);
+                }
+                const std::vector<int> pcores = llama_moe_performance_cpus();
+                const bool pin = std::getenv("LLAMA_MOE_CACHE_NO_PIN") == nullptr && (int) pcores.size() >= nt;
+                if (pin) {
+                    for (int i = 0; i < nt; ++i) {
+                        if (pcores[i] < GGML_MAX_N_THREADS) {
+                            tpp.cpumask[pcores[i]] = true;
+                        }
+                    }
+                    tpp.strict_cpu = true;
+                }
+                cpu_tp = tp_new(&tpp);
+                if (cpu_tp) {
+                    cpu_tp_free = tp_free;
+                    set_tp(cpu_backend.get(), cpu_tp);
+                    LLAMA_LOG_INFO("%s: CPU misses on a persistent threadpool: %d threads, %s, poll %u\n", __func__, nt,
+                        pin ? "pinned to performance cores" : "OS placement", tpp.poll);
+                }
+            }
+        }
+
+    }
+
+    void set_n_threads(int n) {
+        if (!threads_from_env) {
+            setup_threads(n);
+        }
+    }
+
     void init_cpu(const llama_model & model, int n_threads) {
         // the biases kept in device memory need a host copy for the CPU
         auto needs_copy = [](const ggml_tensor * t) { return t != nullptr && !ggml_backend_buffer_is_host(t->buffer); };
@@ -1094,14 +1193,9 @@ struct llama_moe_cache::impl {
         if (!cpu_backend) {
             throw std::runtime_error("MoE cache CPU misses need the CPU backend");
         }
-        if (n_threads > 0) {
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_backend.get()));
-            auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-            if (set_n_threads) {
-                set_n_threads(cpu_backend.get(), n_threads);
-            }
-        }
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend.get()));
+
+        setup_threads(n_threads);
 
         // opt-in: MXFP4 experts (gpt-oss) on a pool of pinned workers instead of a ggml graph per layer; on the Blade
         // (i9-13950HX) the ggml graph was faster once the doorbell removed the host stalls (0.57 vs 0.74 ms an expert)
@@ -1407,6 +1501,14 @@ struct llama_moe_cache::impl {
             pool_stop = true;
             pool.join();
         }
+        if (stager.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(stager_mtx);
+                stager_stop = true;
+            }
+            stager_cv.notify_all();
+            stager.join();
+        }
         if (worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(mtx);
@@ -1414,6 +1516,10 @@ struct llama_moe_cache::impl {
             }
             cv.notify_all();
             worker.join();
+        }
+        if (cpu_tp && cpu_tp_free) {
+            cpu_tp_free(cpu_tp);
+            cpu_tp = nullptr;
         }
         if (galloc) {
             ggml_gallocr_free(galloc);
@@ -1611,6 +1717,10 @@ void llama_moe_cache::doorbell_prepare(int32_t il, int op, float alpha, float li
 
 void llama_moe_cache::begin_ubatch() {
     pimpl->begin_ubatch();
+}
+
+void llama_moe_cache::set_n_threads(int n_threads) {
+    pimpl->set_n_threads(n_threads);
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

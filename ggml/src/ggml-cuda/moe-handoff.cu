@@ -44,12 +44,17 @@ static __global__ void moe_publish_kernel(const float * __restrict__ x, const in
     }
 }
 
-static __global__ void moe_wait_kernel(ggml_moe_mailbox * mb) {
+// on timeout the result is zeroed in place so that the copy that follows reads zeros, and error is raised for the host
+static __global__ void moe_wait_kernel(ggml_moe_mailbox * mb, const int64_t n) {
     const uint32_t want  = mb->seq;
     const uint64_t limit = (uint64_t) mb->timeout_ms * 1000000ull;
     const uint64_t t0    = moe_now();
     while (mb->flag != want) {
         if (limit != 0 && moe_now() - t0 > limit) {
+            volatile float * res = mb->res;
+            for (int64_t i = 0; i < n; ++i) {
+                res[i] = 0.0f;
+            }
             mb->error = 1u;
             __threadfence_system();
             return;
@@ -59,14 +64,6 @@ static __global__ void moe_wait_kernel(ggml_moe_mailbox * mb) {
 #endif
     }
     __threadfence_system();
-}
-
-static __global__ void moe_take_kernel(const ggml_moe_mailbox * mb, float * __restrict__ dst, const int64_t n) {
-    const volatile float * src = mb->res;
-    const bool failed = mb->error != 0u;
-    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
-        dst[i] = failed ? 0.0f : src[i];
-    }
 }
 
 void ggml_cuda_op_moe_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -81,9 +78,11 @@ void ggml_cuda_op_moe_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_nelements(x), (int) ggml_nelements(ids), mb, (int32_t *) dst->data);
     } else {
         const int64_t n = ggml_nelements(dst);
-        moe_wait_kernel<<<1, 1, 0, stream>>>(mb);
-        const int blocks = (int) std::min<int64_t>(32, (n + 255)/256);
-        moe_take_kernel<<<blocks, 256, 0, stream>>>(mb, (float *) dst->data, n);
+        moe_wait_kernel<<<1, 1, 0, stream>>>(mb, n);
+        // the result comes over on the copy engine: a kernel reading mapped host memory took ~180 us for 46 KB on
+        // the Blade (RTX 4070 Laptop, PCIe 4.0 x8), the DMA takes a few us. The mailbox's res pointer never changes,
+        // so the copy can be captured in the decode graph.
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, mb->res, n*sizeof(float), cudaMemcpyHostToDevice, stream));
     }
     CUDA_CHECK(cudaGetLastError());
 }

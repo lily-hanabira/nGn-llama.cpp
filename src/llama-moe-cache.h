@@ -58,6 +58,9 @@ public:
     // called before each ubatch's graph is computed: applies promotions and refreshes the device tables
     void begin_ubatch();
 
+    // the CPU threads that compute misses (llama_set_n_threads)
+    void set_n_threads(int n_threads);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
