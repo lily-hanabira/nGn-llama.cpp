@@ -425,11 +425,14 @@ struct llama_moe_cache::impl {
         } else if (const char * v = std::getenv("LLAMA_MOE_CACHE_CPU_MISS")) {
             cpu_mode = std::clamp(std::atoi(v), 0, 2);
         }
+        bool promote_from_env = false;
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE")) {
             promote_max = std::max(0, std::atoi(v));
+            promote_from_env = true;
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE_EVERY")) {
             promote_every = std::max(1, std::atoi(v));
+            promote_from_env = true;
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_PROMOTE_BUDGET")) {
             promote_budget = std::max(0, std::atoi(v));
@@ -455,6 +458,12 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+        }
+        // nGn: without the doorbell (Vulkan, or the inline mode) every promotion is a synchronous upload of a whole expert
+        // in the middle of the graph; one a layer on every ubatch more than cancels the cache
+        if (cpu_mode != 0 && !doorbell_on && !promote_from_env) {
+            promote_max   = 2;
+            promote_every = 8;
         }
         if (const char * v = std::getenv("LLAMA_MOE_CACHE_THREADS")) {
             n_threads = std::max(1, std::atoi(v));

@@ -2797,7 +2797,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cpu-misses"}, "off|inline|on",
         "where the experts the MoE cache misses run: 'off' uploads them to the GPU, 'inline' computes them on the CPU, "
-        "'on' computes them on the CPU overlapped with the GPU (the decode doorbell) (default: off)",
+        "'on' computes them on the CPU overlapped with the GPU (the decode doorbell on CUDA, per-layer callbacks elsewhere) (default: off)",
         [](common_params & params, const std::string & value) {
             if (value == "off") { params.moe_cpu_misses = 0; }
             else if (value == "inline") { params.moe_cpu_misses = 1; }
