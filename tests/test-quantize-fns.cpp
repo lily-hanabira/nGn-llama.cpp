@@ -9,6 +9,7 @@
 #include <cmath>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <vector>
 
@@ -243,6 +244,100 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// The Q2_0 x Q8_0 kernel against an exact reference on raw blocks, including codes and
+// int8 values that quantize_row_q8_0 never produces (y = -128). Integer partial sums
+// must be exact, so only float accumulation order may differ from the reference.
+static int test_vec_dot_q2_0_exact(bool verbose) {
+    const size_t q2_size = ggml_type_size(GGML_TYPE_Q2_0); // ggml_half d + 16 bytes of codes
+    const size_t q8_size = ggml_type_size(GGML_TYPE_Q8_0); // ggml_half d + 32 int8
+    GGML_ASSERT(ggml_blck_size(GGML_TYPE_Q2_0) == 64 && q2_size == 18);
+    GGML_ASSERT(ggml_blck_size(GGML_TYPE_Q8_0) == 32 && q8_size == 34);
+
+    const auto * qfns_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
+    GGML_ASSERT(qfns_cpu->vec_dot_type == GGML_TYPE_Q8_0);
+
+    uint32_t rng = 12345;
+    const auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+
+    enum codes_kind { CODES_RANDOM, CODES_ALL_0, CODES_ALL_3 };
+    enum y_kind     { Y_RANDOM, Y_ALL_127, Y_ALL_M128 };
+    struct test_case { const char * name; int n; codes_kind codes; y_kind y; };
+    const test_case cases[] = {
+        { "random",          64, CODES_RANDOM, Y_RANDOM   },
+        { "random",        4096, CODES_RANDOM, Y_RANDOM   },
+        { "codes 0",         64, CODES_ALL_0,  Y_RANDOM   },
+        { "codes 3",       4096, CODES_ALL_3,  Y_RANDOM   },
+        { "y +127",        4096, CODES_RANDOM, Y_ALL_127  },
+        { "y -128",        4096, CODES_RANDOM, Y_ALL_M128 },
+        { "codes 0, y -128", 64, CODES_ALL_0,  Y_ALL_M128 },
+        { "codes 3, y +127", 64, CODES_ALL_3,  Y_ALL_127  },
+        { "codes 3, y -128", 4096, CODES_ALL_3, Y_ALL_M128 },
+    };
+
+    int num_failed = 0;
+    printf("Testing q2_0 x q8_0 exact:\n");
+    for (const auto & tc : cases) {
+        const int nb = tc.n / 64;
+        std::vector<uint8_t> xq(nb * q2_size);
+        std::vector<uint8_t> yq(2 * nb * q8_size);
+
+        for (int i = 0; i < nb; ++i) {
+            uint8_t * blk = xq.data() + i * q2_size;
+            const ggml_fp16_t d = ggml_fp32_to_fp16((next() % 2 ? 1.0f : -1.0f) * (0.25f + (next() % 1000) / 500.0f));
+            memcpy(blk, &d, sizeof(d));
+            for (int j = 0; j < 16; ++j) {
+                blk[2 + j] = tc.codes == CODES_ALL_0 ? 0x00 : tc.codes == CODES_ALL_3 ? 0xFF : (uint8_t) next();
+            }
+        }
+        for (int i = 0; i < 2 * nb; ++i) {
+            uint8_t * blk = yq.data() + i * q8_size;
+            const ggml_fp16_t d = ggml_fp32_to_fp16((next() % 2 ? 1.0f : -1.0f) * (0.25f + (next() % 1000) / 500.0f));
+            memcpy(blk, &d, sizeof(d));
+            for (int j = 0; j < 32; ++j) {
+                blk[2 + j] = tc.y == Y_ALL_127 ? (uint8_t) 127 : tc.y == Y_ALL_M128 ? (uint8_t) 0x80 : (uint8_t) next();
+            }
+        }
+
+        // reference: sum_i d0 * sum_k d1 * sum_j (code_j - 1) * y_j, with weight 4*b + m = (qs[b] >> 2*m) & 3
+        double ref = 0.0;
+        double mag = 0.0; // sum of |terms|, so the relative error is stable when the result cancels
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t * xb = xq.data() + i * q2_size;
+            ggml_fp16_t d0h;
+            memcpy(&d0h, xb, sizeof(d0h));
+            const double d0 = ggml_fp16_to_fp32(d0h);
+            for (int k = 0; k < 2; ++k) {
+                const uint8_t * yb = yq.data() + (2 * i + k) * q8_size;
+                ggml_fp16_t d1h;
+                memcpy(&d1h, yb, sizeof(d1h));
+                const double d1 = ggml_fp16_to_fp32(d1h);
+                int64_t isum = 0;
+                int64_t iabs = 0;
+                for (int w = 0; w < 32; ++w) {
+                    const int code = (xb[2 + 8 * k + w / 4] >> (2 * (w % 4))) & 3;
+                    const int prod = (code - 1) * (int8_t) yb[2 + w];
+                    isum += prod;
+                    iabs += prod < 0 ? -prod : prod;
+                }
+                ref += d0 * d1 * (double) isum;
+                mag += fabs(d0 * d1) * (double) iabs;
+            }
+        }
+
+        float result = INFINITY;
+        qfns_cpu->vec_dot(tc.n, &result, 0, xq.data(), 0, yq.data(), 0, 1);
+
+        const double rel_err = mag > 0.0 ? fabs((double) result - ref) / mag : fabs((double) result);
+        const bool failed = !(rel_err <= 1e-5);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  %-16s n=%4d: %s (ref=%f got=%f rel_err=%g)\n", tc.name, tc.n, RESULT_STR[failed], ref, result, rel_err);
+        }
+    }
+
+    return num_failed;
+}
+
 // In every group, all values with importance are equal, and the max (0) has none.
 // The scale search in make_qkx3_quants then fits min == max and passes inf/nan to nearest_int (#29804).
 static int test_quantize_imatrix_degenerate(bool verbose) {
@@ -300,6 +395,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_vec_dot_q2_0_exact(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
     if (num_failed || verbose) {
