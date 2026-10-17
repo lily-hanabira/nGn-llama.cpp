@@ -1584,6 +1584,25 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
     return x;
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_lookup(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    if (!hadamard_inverses) {
+        return cur;
+    }
+    const auto it = hadamard_inverses->find(w);
+    if (it == hadamard_inverses->end()) {
+        return cur;
+    }
+    // a Hadamard-latent table stores rotated rows; restore the primal basis
+    // right after the lookup: h = s * (H z)
+    cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+    if (it->second.signs) {
+        cur = ggml_mul(ctx0, cur, it->second.signs);
+    }
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -2623,17 +2642,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // TODO: when lora is active, this is likely going to cause issues similar to https://github.com/ggml-org/llama.cpp/pull/30160
     //       need to add lora tests and refactor the logic to make the lora GET_ROWS go at the front of the graph
     auto build_tok = [&](ggml_tensor * cur, ggml_tensor * ids) {
-        // a Hadamard-latent embedding table stores rotated rows; restore the
-        // primal basis right after the lookup: h = s * (H z)
-        if (hadamard_inverses) {
-            const auto it = hadamard_inverses->find(tok_embd);
-            if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
-                if (it->second.signs) {
-                    cur = ggml_mul(ctx0, cur, it->second.signs);
-                }
-            }
-        }
+        cur = build_hadamard_lookup(tok_embd, cur);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
