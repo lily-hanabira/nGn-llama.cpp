@@ -2176,6 +2176,38 @@ struct llama_model_falcon_h1 : public llama_model_base {
 };
 
 
+struct llama_memory_recurrent_context;
+
+struct llm_build_lfm_base : public llm_graph_context {
+    llm_build_lfm_base(const llm_graph_params & params);
+
+    virtual ~llm_build_lfm_base() = default;
+
+    ggml_tensor * build_lfm_shortconv(const llama_model & model,
+                                      const llama_memory_recurrent_context * mctx_recr,
+                                      llm_graph_input_rs * inp_recr,
+                                      ggml_tensor * cur,
+                                      int il);
+
+    ggml_tensor * build_lfm_dense_ffn(const llama_model & model,
+                                      ggml_tensor * cur,
+                                      int il);
+
+};
+
+struct llama_model_lfm3 : public llama_model_base {
+    llama_model_lfm3(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_lfm_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_lfm2 : public llama_model_base {
     llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

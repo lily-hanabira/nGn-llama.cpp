@@ -179,6 +179,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     }
 
+    if (arch == LLM_ARCH_LFM3) { n_layer = 3; }
+
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
@@ -218,7 +220,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
-            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
+            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_LFM3 || arch == LLM_ARCH_KIMI_LINEAR ||
             arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
@@ -409,6 +411,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP, 7.0f);
     }
 
+    if (arch == LLM_ARCH_LFM3) {
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>({0, 0, 1}));
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA, 10000.0f);
+    }
+
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
@@ -464,7 +471,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
     }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
-    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
+    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(arch == LLM_ARCH_LFM3 ? 7 : 3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
     ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
